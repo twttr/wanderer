@@ -1,0 +1,16 @@
+{
+  "name": "wander",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "start": "node --env-file=.env server.ts",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  }
+}

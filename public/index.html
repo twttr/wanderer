@@ -1,0 +1,1047 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>wanderer</title>
+<style>
+  :root {
+    --rail: 320px;
+    --bg: #05070b; --panel: #080b11; --edge: #141b24; --line: #0e141b;
+    --text: #8698aa; --strong: #eaf2fa; --soft: #b9c9da; --muted: #4d5d6e;
+    --track: #1b2530; --chip: #111925;
+  }
+  :root[data-theme="light"] {
+    --bg: #e9edf1; --panel: #f6f8fa; --edge: #dbe2e9; --line: #e6ebf0;
+    --text: #5b6773; --strong: #10171e; --soft: #2b3742; --muted: #97a4b0;
+    --track: #dde4ea; --chip: #e7ecf1;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  body {
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text); color-scheme: dark;
+  }
+  :root[data-theme="light"] body { color-scheme: light; }
+
+  /* Hidden until the view is final. The globe is placed twice on startup —
+     once from the remembered position, then again when the walker's real
+     position arrives a network round-trip later — and showing that reads as a
+     fast zoom followed by a pan. */
+  #globe { position: fixed; inset: 0 var(--rail) 0 0; opacity: 0; transition: opacity 0.7s ease; }
+  /* Re-parented into globe.gl's scene container at startup so it paints above
+     the WebGL canvas but below the marker layer; the walker must stay on top. */
+  #overlay { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
+
+  #hud {
+    position: fixed; left: 0; right: var(--rail); bottom: 0;
+    display: flex; gap: 22px; align-items: baseline; flex-wrap: nowrap;
+    padding: 24px 20px 14px; letter-spacing: 0.08em;
+    background: linear-gradient(transparent, var(--bg) 70%);
+    pointer-events: none;
+  }
+  #where {
+    color: var(--soft); flex: 1 1 auto; min-width: 12ch;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #hud b { color: var(--strong); font-weight: 500; }
+  #hud > span:not(#where):not(#err):not(#attr) { flex: none; white-space: nowrap; }
+  #err {
+    color: #8a6450; flex: 0 1 auto; max-width: 18ch;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #attr { color: var(--muted); flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  button {
+    background: none; border: 1px solid var(--edge); color: var(--text);
+    font: inherit; letter-spacing: 0.08em; padding: 3px 10px;
+    border-radius: 2px; cursor: pointer;
+  }
+  button:hover { color: var(--strong); border-color: var(--muted); }
+  button[aria-pressed="true"] { background: var(--chip); color: var(--strong); border-color: var(--muted); }
+  #pause { pointer-events: auto; flex: none; }
+
+  #rail {
+    position: fixed; top: 0; right: 0; bottom: 0; width: var(--rail);
+    display: flex; flex-direction: column; gap: 16px;
+    padding: 18px; box-sizing: border-box; overflow: hidden;
+    background: var(--panel); border-left: 1px solid var(--edge);
+  }
+  #controls { display: flex; gap: 6px; }
+  #controls .grow { flex: 1; display: flex; gap: 6px; }
+  #controls .grow button { flex: 1; padding: 4px 0; }
+  #theme { flex: none; padding: 4px 10px; }
+  #rail h2 {
+    margin: 0 0 8px; font: inherit; font-size: 10px; letter-spacing: 0.18em;
+    color: var(--muted); text-transform: uppercase;
+  }
+  #here { color: var(--soft); line-height: 1.5; }
+  #here small { display: block; color: var(--muted); }
+  #verdict { color: var(--strong); font-size: 15px; line-height: 1.35; }
+  #verdict span { color: var(--accent); }
+  #mood { color: var(--muted); margin-top: 2px; }
+
+  .bar { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; margin-top: 9px; }
+  .bar .name { color: var(--text); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar .pct { text-align: right; color: var(--soft); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .bar .track { grid-column: 1 / -1; height: 5px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--accent); border-radius: 3px; }
+  .bar.dim .name, .bar.dim .pct { color: var(--muted); }
+  .bar.dim .fill { opacity: 0.45; }
+
+  #feed { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+  #feedrows { overflow: hidden; font-size: 11px; }
+  #feedrows div { display: flex; gap: 10px; padding: 3px 0; border-bottom: 1px solid var(--line); color: var(--text); }
+  #feedrows b { color: var(--soft); font-weight: 400; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #feedrows i { font-style: normal; color: var(--muted); }
+
+  .walker { pointer-events: none; transform: translate(-50%, -62%); }
+  .walker.westward { transform: translate(-50%, -62%) scaleX(-1); }
+  .walker svg { display: block; animation: bob 0.56s ease-in-out infinite; }
+  .walker .pose { animation: stride 0.56s steps(1, end) infinite; }
+  .walker .pose-b { animation-delay: -0.28s; }
+  .walker.still svg, .walker.still .pose { animation-play-state: paused; }
+  @keyframes stride { 0%, 49.9% { opacity: 1 } 50%, 100% { opacity: 0 } }
+  @keyframes bob { 0%, 100% { transform: translateY(0) } 50% { transform: translateY(-1.5px) } }
+
+  /* After the rail's own rules, or `display: none` loses on source order. */
+  @media (max-width: 680px) {
+    :root { --rail: 0px; }
+    #rail { display: none; }
+  }
+</style>
+
+<div id="globe"></div>
+<canvas id="overlay"></canvas>
+<div id="hud">
+  <span id="where">…</span>
+  <span><b id="km">0</b> km</span>
+  <span><b id="stops">0</b> forks</span>
+  <span><b id="days">0</b> days</span>
+  <span><b id="countries">0</b> countries</span>
+  <span id="err"></span>
+  <span id="attr"></span>
+  <button id="pause">pause</button>
+</div>
+<aside id="rail">
+  <div id="controls">
+    <span class="grow" id="basemaps"></span>
+      <button id="theme" title="switch light / dark"></button>
+  </div>
+  <div>
+    <h2>Walking</h2>
+    <div id="here">…<small id="onroad"></small></div>
+  </div>
+  <div>
+    <h2>Next road</h2>
+    <div id="verdict">…</div>
+    <div id="mood"></div>
+    <div id="choices"></div>
+  </div>
+  <div>
+    <h2>Judgements</h2>
+    <div id="judgements"></div>
+  </div>
+  <div id="feed">
+    <h2>Feed</h2>
+    <div id="feedrows"></div>
+  </div>
+</aside>
+
+<script src="https://cdn.jsdelivr.net/npm/globe.gl@2"></script>
+<script>
+  const store = {
+    get(k, fallback) { try { return localStorage.getItem(k) ?? fallback; } catch { return fallback; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  };
+
+  // Keyless raster basemaps. Google and Apple are deliberately absent: both
+  // require a key and forbid rendering their tiles outside their own SDKs.
+  // Served through our own process, which caches each tile on disk. Reloads
+  // then cost nothing and Esri is asked for each tile exactly once.
+  const BASEMAPS = {
+    map: { dark: 'dark', light: 'light', maxLevel: 16, credit: 'Esri · OpenStreetMap' },
+    satellite: { both: 'imagery', maxLevel: 17, credit: 'Esri · Maxar · Earthstar Geographics' },
+    terrain: { both: 'topo', maxLevel: 17, credit: 'Esri · OpenStreetMap' },
+  };
+
+  // Shown when zoomed out past the point where map tiles are worth fetching.
+  const FAR_IMAGE = {
+    dark: 'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg',
+    light: 'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg',
+  };
+  const TILES_OFF_ABOVE = 0.05;
+  const TILE_PIXELS = 256;
+  const MAX_TILES = 120;
+  const TILE_CACHE_MAX = 240;
+  // Map tiles and the 2D overlay must sit at exactly the same altitude. A
+  // difference of even a hundred metres projects to a visible offset as soon as
+  // the view is off vertical, which reads as the trace sliding off the roads.
+  const SURFACE_ALT = 0.00002;
+
+  // Remembered so a reload opens at the right place and zoom immediately,
+  // without the globe sitting at its default whole-world view first.
+  function lastPov() {
+    try {
+      const p = JSON.parse(store.get('pov', ''));
+      if (isFinite(p.lat) && isFinite(p.lng) && isFinite(p.altitude)) return p;
+    } catch {}
+    return { lat: 43.6766, lng: 4.6278, altitude: 0.0009 };
+  }
+
+  // Bisect switches: ?tiles=off draws no map tiles, ?trace=off skips the 2D
+  // overlay. Between them they isolate which subsystem a failure belongs to.
+  const flags = new URLSearchParams(location.search);
+  const TILES_ENABLED = flags.get('tiles') !== 'off';
+  const TRACE_ENABLED = flags.get('trace') !== 'off';
+
+  let basemap = store.get('map', new URLSearchParams(location.search).get('map') || 'satellite');
+  if (!BASEMAPS[basemap]) basemap = 'satellite';
+  let theme = store.get('theme', 'dark');
+
+  // Pink through violet to cyan: none of it occurs in aerial imagery or in a
+  // canvas basemap, so the trace stays legible over anything.
+  const hue = (remoteness) => 320 - (Math.min(3, Math.max(0, remoteness)) / 3) * 140;
+  const traceColor = (remoteness, headness, alpha = 1) =>
+    `hsla(${hue(remoteness)}, 100%, ${(theme === 'light' ? 42 : 52) + headness * 14}%, ${alpha})`;
+
+  // A walking figure rather than a dot: two poses swapped on a step timer, with
+  // a dark casing stroke underneath so it reads over bright aerial imagery.
+  const POSES = [
+    'M0,-6 v7 M0,-1 l-4,7 M0,-1 l4,6 M0,2 l-5,-3 M0,2 l5,-2',
+    'M0,-6 v7 M0,-1 l-1,7 M0,-1 l2,7 M0,2 l-2,-4 M0,2 l2,-4',
+  ];
+
+  function walkerElement(color, westward, still) {
+    const wrap = document.createElement('div');
+    wrap.className = 'walker' + (westward ? ' westward' : '') + (still ? ' still' : '');
+    wrap.innerHTML =
+      '<svg viewBox="-10 -12 20 22" width="26" height="29">' +
+      POSES.map((d, i) =>
+        '<g class="pose pose-' + (i ? 'b' : 'a') + '" fill="none" stroke-linecap="round">' +
+          '<circle cx="0" cy="-8" r="2.2" stroke="#000" stroke-opacity="0.6" stroke-width="4"/>' +
+          '<path d="' + d + '" stroke="#000" stroke-opacity="0.6" stroke-width="4.4"/>' +
+          '<circle cx="0" cy="-8" r="2.2" fill="' + color + '" stroke="none"/>' +
+          '<path d="' + d + '" stroke="' + color + '" stroke-width="1.9"/>' +
+        '</g>').join('') +
+      '</svg>';
+    return wrap;
+  }
+
+  const stage = document.getElementById('globe');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+
+  function reparentOverlay() {
+    const scene = stage.querySelector('.scene-container');
+    if (!scene || overlay.parentElement === scene) return;
+    scene.appendChild(overlay);
+    for (const child of scene.children) {
+      // The marker layer is the positioned div holding globe.gl's HTML elements.
+      if (child !== overlay && child.tagName === 'DIV' && !child.className) child.style.zIndex = '1';
+    }
+  }
+
+  const service = () => BASEMAPS[basemap].both ?? BASEMAPS[basemap][theme];
+  const tileUrl = (z, x, y) => `/tile?s=${service()}&z=${z}&y=${y}&x=${x}`;
+
+  let globe = null;
+  let camera = null;
+  let threeGlobe = null;
+  let povSent = 0;
+  let globeBuiltAt = 0;
+  let povX = NaN, povY = NaN, povZ = NaN;
+  let interacting = false;
+  let lastInteraction = 0;
+
+  // globe.gl's tile engine will not fetch a single tile above zoom 6 until it
+  // has been handed a point of view — without one it builds the whole globe at
+  // the current level and loads nothing, which is why the map stayed blank
+  // until the viewer happened to zoom. setPointOfView is three-globe's method
+  // for that; globe.gl does not re-expose it, so reach the instance via the
+  // scene (lazily — it is not there at init) and feed it the camera.
+  function syncPov(now) {
+    if (!globe) return;
+
+    // Every setPointOfView makes globe.gl re-cull the whole tile set, inverting
+    // a matrix per tile — a quarter of a million allocations showed up under it
+    // in a profile. So: at most once per frame (this is the only caller), rate
+    // limited, and skipped entirely while the camera is sitting still.
+    const settling = now - globeBuiltAt < 4000;
+    if (now - povSent < (settling ? 120 : 400)) return;
+
+    const p = camera.position;
+    const moved = Math.abs(p.x - povX) + Math.abs(p.y - povY) + Math.abs(p.z - povZ);
+    if (!settling && !(moved > 1e-4) && now - povSent < 3000) return;
+
+    povSent = now;
+    povX = p.x; povY = p.y; povZ = p.z;
+
+    if (!threeGlobe) {
+      // Looked up lazily: globe.gl has not added it to the scene at init time.
+      globe.scene().traverse((o) => {
+        if (!threeGlobe && typeof o.setPointOfView === 'function') threeGlobe = o;
+      });
+    }
+    if (!threeGlobe) return;
+    try {
+      threeGlobe.setPointOfView(camera);
+    } catch {
+      // globe.gl's tile cull throws "Too many properties to enumerate" once its
+      // per-level tile tables have grown far enough. Dropping the level makes it
+      // dispose them and rebuild from what is actually on screen.
+      let engine = null;
+      globe.scene().traverse((o) => {
+        if (!engine && o.tileUrl !== undefined) engine = o;
+      });
+      try { if (engine) engine.level = 0; } catch {}
+    }
+  }
+
+
+  // globe.gl's tile engine holds on to in-flight loads and textures from the
+  // previous source, so swapping the url leaves bands of the old basemap
+  // stitched through the new one however the internals are poked. Rebuilding
+  // the globe is the only reliable swap, and basemap changes are rare.
+  function buildGlobe() {
+    const pov = globe ? globe.pointOfView() : null;
+    if (globe) {
+      // Drop the WebGL context explicitly. Browsers allow only a handful, and
+      // the backing GPU resources hold OS handles that are not released by
+      // dropping the JS reference alone.
+      try {
+        const renderer = globe.renderer();
+        renderer.dispose();
+        renderer.forceContextLoss();
+      } catch {}
+      if (typeof globe._destructor === 'function') {
+        try { globe._destructor(); } catch {}
+      }
+    }
+    stage.innerHTML = '';
+    threeGlobe = null;
+    povSent = 0;
+    globeBuiltAt = performance.now();
+
+    globe = Globe()(stage)
+      .width(stage.clientWidth)
+      .height(stage.clientHeight)
+      .backgroundColor(theme === 'light' ? '#dfe5eb' : '#05070b')
+      .globeImageUrl(FAR_IMAGE[theme])
+      // Its own tile engine is never started: it sizes a tile range from the
+      // camera altitude while taking the zoom level from a separate update, so
+      // mid-zoom it can ask for tens of thousands of tiles in one pass and take
+      // the tab with it. The layer below is driven by us instead.
+      .globeTileEngineUrl(null)
+      .globeCurvatureResolution(2)
+      .tileLat('lat')
+      .tileLng('lng')
+      .tileWidth('width')
+      .tileHeight('height')
+      .tileAltitude(SURFACE_ALT)
+      .tileMaterial('material')
+      .tilesTransitionDuration(0)
+      .atmosphereColor('#3a6ea5')
+      .atmosphereAltitude(0.18)
+      .htmlElementsData([])
+      .htmlLat('lat')
+      .htmlLng('lon')
+      .htmlAltitude(SURFACE_ALT)
+      .htmlElement((d) => d.build());
+
+    camera = globe.camera();
+
+    // The overlay is drawn immediately after globe.gl renders, inside the same
+    // call, so it always uses exactly the camera the WebGL frame was drawn
+    // with. Painting from our own animation callback left it a frame out of
+    // step no matter where in the queue it ran, which is the trace shaking.
+    const renderer = globe.renderer();
+    if (!renderer.__wandererHooked) {
+      const draw = renderer.render.bind(renderer);
+      renderer.render = (scene, cam) => {
+        draw(scene, cam);
+        // Every frame, unconditionally. Throttling this is what made the trace
+        // shake: the map redraws at 60fps and a rate-limited overlay simply
+        // stops following it for a frame or two at a time. A draw is about a
+        // millisecond, which is affordable to always be in step.
+        reparentOverlay();
+        drawOverlay();
+      };
+      renderer.__wandererHooked = true;
+    }
+
+    const controls = globe.controls();
+    controls.autoRotate = false;
+    controls.enableDamping = true;
+    controls.minDistance = 100 * (1 + 0.000008);
+
+    // Redraw the moment the camera changes, not just on the next animation
+    // frame: at one frame behind, the trace visibly swims against the map
+    // while it is being dragged.
+    // Coalesced. OrbitControls fires `change` repeatedly within a single frame
+    // while the camera is being dragged or flown, and painting on each one
+    // re-projected the whole trace many times per frame — a burst of allocation
+    // big enough to exhaust the heap mid-animation.
+    controls.addEventListener('change', requestPaint);
+
+    controls.addEventListener('start', () => {
+      interacting = true;
+      // Stop any follow fly-to dead, or it fights the drag and the map shakes.
+      globe.pointOfView(globe.pointOfView(), 0);
+    });
+    controls.addEventListener('end', () => {
+      interacting = false;
+      lastInteraction = performance.now();
+      followAltitude = Math.min(2.5, Math.max(0.00002, viewAltitude()));
+    });
+
+    globe.onZoom(() => {
+      const near = viewAltitude() * 100 * 0.02;
+      if (Math.abs(camera.near - near) > near * 0.05) {
+        camera.near = near;
+        camera.updateProjectionMatrix();
+      }
+      tilesDirty = true;
+    });
+
+    sizeCanvas();
+    // Immediately, before a frame is rendered. Left at globe.gl's default
+    // whole-world view the tile engine starts loading low zoom levels, and
+    // every level it passes through costs another screenful of requests.
+    globe.pointOfView(pov ?? lastPov(), 0);
+    povSent = 0;
+    syncPov(performance.now());
+    if (latest) { markers(latest); requestPaint(); }
+  }
+
+  // Map tiles, driven by us rather than by globe.gl's engine. We decide which
+  // tiles exist, cap how many there can ever be, and evict textures on the way
+  // out, so nothing accumulates and no single pass can be enormous.
+  const tileCache = new Map();
+  let MatCtor = null;
+  let TexCtor = null;
+  let texColorSpace;
+  let tilesDirty = true;
+  let tilesShown = 0;
+  let currentTiles = [];
+  const tilesReady = () =>
+    !currentTiles.length
+      ? 0
+      : currentTiles.filter((t) => t.material.userData.ready).length / currentTiles.length;
+
+  function ctorsReady() {
+    if (MatCtor && TexCtor) return true;
+    const m = globe && globe.globeMaterial && globe.globeMaterial();
+    if (!m) return false;
+    MatCtor = m.constructor;
+    if (m.map) {
+      TexCtor = m.map.constructor;
+      texColorSpace = m.map.colorSpace;
+    }
+    return !!(MatCtor && TexCtor);
+  }
+
+  function tileMaterial(z, x, y) {
+    const key = `${service()}/${z}/${x}/${y}`;
+    const hit = tileCache.get(key);
+    if (hit) {
+      tileCache.delete(key);
+      tileCache.set(key, hit);
+      return hit;
+    }
+    const tex = new TexCtor();
+    if (texColorSpace !== undefined) tex.colorSpace = texColorSpace;
+    const mat = new MatCtor({ map: tex });
+    const img = new Image();
+    img.onload = () => {
+      tex.image = img;
+      tex.needsUpdate = true;
+      mat.needsUpdate = true;
+      mat.userData.ready = true;
+    };
+    img.src = tileUrl(z, x, y);
+    tileCache.set(key, mat);
+    while (tileCache.size > TILE_CACHE_MAX) {
+      const oldest = tileCache.keys().next().value;
+      const dead = tileCache.get(oldest);
+      tileCache.delete(oldest);
+      try { dead.map && dead.map.dispose(); dead.dispose(); } catch {}
+    }
+    return mat;
+  }
+
+  const POW = (z) => Math.pow(2, z);
+  const lng2tile = (lng, z) => ((lng + 180) / 360) * POW(z);
+  const lat2tile = (lat, z) => {
+    const r = (Math.max(-85, Math.min(85, lat)) * Math.PI) / 180;
+    return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * POW(z);
+  };
+  const tile2lng = (x, z) => (x / POW(z)) * 360 - 180;
+  const tile2lat = (y, z) => {
+    const n = Math.PI - (2 * Math.PI * y) / POW(z);
+    return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+  };
+
+  function updateTiles() {
+    if (!globe) return;
+    const alt = viewAltitude();
+    if (!TILES_ENABLED || alt > TILES_OFF_ABOVE) {
+      if (tilesShown) { globe.tilesData([]); tilesShown = 0; }
+      return;
+    }
+    if (!ctorsReady()) {
+      // The texture class is borrowed from the globe's own image, which loads
+      // asynchronously — keep asking until it is there.
+      tilesDirty = true;
+      return;
+    }
+
+    // Visible ground extent for a 50 degree vertical field of view: the half
+    // angle subtended at the globe's centre is about 26.7 degrees per unit of
+    // altitude. An earlier guess of 90x1.7 claimed nearly six times as much
+    // ground as is actually on screen, which picked a far coarser zoom level.
+    const pov = globe.pointOfView();
+    const aspect = stage.clientWidth / Math.max(1, stage.clientHeight);
+    const halfLat = Math.min(60, alt * 26.7 * 1.15);
+    const halfLng = Math.min(60, (halfLat * aspect) / Math.max(0.15, Math.cos((pov.lat * Math.PI) / 180)));
+    // Tiles are 256 device pixels, not CSS pixels — on a retina display sizing
+    // them in CSS pixels throws away another level of detail.
+    const across = Math.max(1, (stage.clientWidth * (devicePixelRatio || 1)) / TILE_PIXELS);
+    let z = Math.round(Math.log2(360 / ((2 * halfLng) / across)));
+    z = Math.max(1, Math.min(BASEMAPS[basemap].maxLevel, z));
+
+    let box = null;
+    for (; z >= 1; z--) {
+      const x0 = Math.floor(lng2tile(pov.lng - halfLng, z));
+      const x1 = Math.floor(lng2tile(pov.lng + halfLng, z));
+      const y0 = Math.floor(lat2tile(pov.lat + halfLat, z));
+      const y1 = Math.floor(lat2tile(pov.lat - halfLat, z));
+      if ((x1 - x0 + 1) * (y1 - y0 + 1) <= MAX_TILES) {
+        box = { z, x0, x1, y0, y1 };
+        break;
+      }
+    }
+    if (!box) return;
+    tilesDirty = false;
+
+    const span = POW(box.z);
+    const data = [];
+    for (let x = box.x0; x <= box.x1; x++) {
+      for (let y = box.y0; y <= box.y1; y++) {
+        if (y < 0 || y >= span) continue;
+        const xi = ((x % span) + span) % span;
+        const north = tile2lat(y, box.z);
+        const south = tile2lat(y + 1, box.z);
+        const west = tile2lng(xi, box.z);
+        const east = tile2lng(xi + 1, box.z);
+        data.push({
+          lat: (north + south) / 2,
+          lng: (west + east) / 2,
+          width: east - west,
+          height: north - south,
+          material: tileMaterial(box.z, xi, y),
+        });
+      }
+    }
+    globe.tilesData(data);
+    currentTiles = data;
+    tilesShown = data.length;
+  }
+
+  const viewAltitude = () => (globe ? Math.max(1e-7, globe.controls().getDistance() / 100 - 1) : 0.0009);
+
+  function sizeCanvas() {
+    reparentOverlay();
+    const r = stage.getBoundingClientRect();
+    overlay.width = Math.round(r.width * devicePixelRatio);
+    overlay.height = Math.round(r.height * devicePixelRatio);
+    overlay.style.width = r.width + 'px';
+    overlay.style.height = r.height + 'px';
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  }
+  sizeCanvas();
+
+  // globe.gl sizes itself to the window, not to its container, so the renderer
+  // has to be told. The tile engine also keeps whatever it culled for the old
+  // frustum, leaving the new area empty, so its tiles are dropped and rebuilt.
+  // Debounced: a drag-resize would otherwise thrash the tile cache.
+  let resizeTimer = 0;
+  function fitToStage() {
+    if (!globe) return;
+    globe.width(stage.clientWidth).height(stage.clientHeight);
+    sizeCanvas();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      povSent = 0;
+      syncPov(performance.now());
+      requestPaint();
+    }, 250);
+  }
+  new ResizeObserver(fitToStage).observe(stage);
+
+  let latest = null;
+  let followed = null;
+  let settled = false;
+  // The trace is held back until the view has actually come to rest over the
+  // walker and the map beneath it has decoded — whatever it was that moved.
+  // Once shown it stays shown; this gates the first reveal only, so panning
+  // later does not make it vanish.
+  let revealed = false;
+  let cameraStillSince = 0;
+  let camX = NaN, camY = NaN, camZ = NaN;
+
+  function cameraAtRest(now) {
+    const p = camera && camera.position;
+    if (!p) return false;
+    if (Math.abs(p.x - camX) + Math.abs(p.y - camY) + Math.abs(p.z - camZ) > 1e-7) {
+      camX = p.x; camY = p.y; camZ = p.z;
+      cameraStillSince = now;
+      return false;
+    }
+    return now - cameraStillSince > 400;
+  }
+  let followAltitude = 0.0009;
+
+  // The server hands over a whole leg at once. Rather than teleport to the next
+  // fork, keep a cursor that creeps along the leg's points, timed to arrive
+  // just as the next one lands.
+  const KM_PER_DEG = 111.32;
+  const segKm = (a, b) => {
+    const dy = (b[0] - a[0]) * KM_PER_DEG;
+    const dx = (b[1] - a[1]) * KM_PER_DEG * Math.cos((((a[0] + b[0]) / 2) * Math.PI) / 180);
+    return Math.hypot(dx, dy);
+  };
+
+  let trail = [];
+  let trailTotal = 0;
+  let cursor = { i: 0, frac: 0 };
+  let speed = 0;
+  let walking = false;
+  const walker = { lat: 0, lon: 0, build: () => walkerElement('#fff', false, false) };
+
+  function cursorAt() {
+    const a = trail[Math.min(cursor.i, trail.length - 1)];
+    const b = trail[Math.min(cursor.i + 1, trail.length - 1)];
+    if (!a) return [0, 0, 0];
+    return [a[0] + (b[0] - a[0]) * cursor.frac, a[1] + (b[1] - a[1]) * cursor.frac, a[2]];
+  }
+
+  function remainingKm() {
+    let km = 0;
+    for (let i = cursor.i; i < trail.length - 1; i++) km += segKm(trail[i], trail[i + 1]);
+    return Math.max(0, km);
+  }
+
+  // WebGL lines are one device pixel wide and globe.gl's tube strokes collapse
+  // below rendering precision at street scale, so the trace is drawn in 2D over
+  // the globe instead. That buys a casing, real width, and width-by-probability
+  // on the spokes.
+  const RAD = Math.PI / 180;
+
+  // Visibility as a dot product against the camera's sub-point rather than a
+  // haversine per point per frame. The trigonometry version showed up as the
+  // single hottest thing in the profile (fdlibm_atan, fdlibm_exp); unit vectors
+  // are computed once per polyline and the per-frame test is multiply-add only.
+  function unitVectors(points) {
+    const v = new Float64Array(points.length * 3);
+    for (let i = 0; i < points.length; i++) {
+      const lat = points[i][0] * RAD;
+      const lon = points[i][1] * RAD;
+      const c = Math.cos(lat);
+      v[i * 3] = c * Math.cos(lon);
+      v[i * 3 + 1] = c * Math.sin(lon);
+      v[i * 3 + 2] = Math.sin(lat);
+    }
+    return v;
+  }
+
+  function viewCone() {
+    const pov = globe.pointOfView();
+    const lat = pov.lat * RAD;
+    const lon = pov.lng * RAD;
+    const c = Math.cos(lat);
+    return {
+      x: c * Math.cos(lon),
+      y: c * Math.sin(lon),
+      z: Math.sin(lat),
+      cos: 1 / (1 + Math.max(1e-9, pov.altitude)),
+    };
+  }
+
+  // Projection buffers, reused between frames. Every point used to be projected
+  // twice a frame (casing then core) and the whole history re-sliced and
+  // re-filtered each time — hundreds of thousands of short-lived objects a
+  // second, growing with the journey, which is enough to exhaust a browser.
+  const px = { x: new Float64Array(0), y: new Float64Array(0), n: 0 };
+
+  function project(points, vecs, cone) {
+    if (px.x.length < points.length) {
+      px.x = new Float64Array(points.length + 512);
+      px.y = new Float64Array(points.length + 512);
+    }
+    let n = 0;
+    let lastX = NaN;
+    let lastY = NaN;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      const dot = vecs[i * 3] * cone.x + vecs[i * 3 + 1] * cone.y + vecs[i * 3 + 2] * cone.z;
+      if (dot < cone.cos) {
+        px.x[n] = NaN; px.y[n] = NaN; n++; lastX = NaN;
+        continue;
+      }
+      const c = globe.getScreenCoords(p[0], p[1], SURFACE_ALT);
+      if (!c || !isFinite(c.x) || !isFinite(c.y)) {
+        px.x[n] = NaN; px.y[n] = NaN; n++; lastX = NaN;
+        continue;
+      }
+      if (Math.abs(c.x - lastX) < 0.7 && Math.abs(c.y - lastY) < 0.7) continue;
+      lastX = c.x; lastY = c.y;
+      px.x[n] = c.x; px.y[n] = c.y; n++;
+    }
+    px.n = n;
+  }
+
+  function strokeProjected(width, colour) {
+    ctx.lineWidth = width;
+    ctx.strokeStyle = colour;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < px.n; i++) {
+      const x = px.x[i];
+      if (!isFinite(x)) { pen = false; continue; }
+      if (pen) ctx.lineTo(x, px.y[i]);
+      else { ctx.moveTo(x, px.y[i]); pen = true; }
+    }
+    ctx.stroke();
+  }
+
+  // The history only changes when the walker crosses a node or new data lands,
+  // a few times a second at most — so it is thinned once and kept, not rebuilt
+  // on every frame.
+  const HEAD_POINTS = 60;
+  let tailCache = [];
+  let tailVecs = new Float64Array(0);
+  let tailBuiltFor = -1;
+  let tailBuiltLen = -1;
+
+  function historyTail() {
+    if (cursor.i === tailBuiltFor && trail.length === tailBuiltLen) return tailCache;
+    const end = Math.max(0, cursor.i - HEAD_POINTS);
+    let tail = trail.slice(0, end + 1);
+    // Thinned by dropping points that barely change direction, never by index.
+    // Taking every Nth point is cheaper but cuts the corners off the route,
+    // which is exactly what you notice on a sharp bend.
+    if (tail.length > 2500) {
+      for (const minTurn of [0.02, 0.06, 0.15, 0.4]) {
+        const kept = [tail[0]];
+        for (let i = 1; i < tail.length - 1; i++) {
+          const a = tail[i - 1];
+          const b = tail[i];
+          const c = tail[i + 1];
+          const abx = b[1] - a[1];
+          const aby = b[0] - a[0];
+          const bcx = c[1] - b[1];
+          const bcy = c[0] - b[0];
+          const turn = Math.abs(Math.atan2(abx * bcy - aby * bcx, abx * bcx + aby * bcy));
+          if (turn > minTurn) kept.push(b);
+        }
+        kept.push(tail[tail.length - 1]);
+        tail = kept;
+        if (tail.length <= 2500) break;
+      }
+    }
+    tailCache = tail;
+    tailVecs = unitVectors(tail);
+    tailBuiltFor = cursor.i;
+    tailBuiltLen = trail.length;
+    return tailCache;
+  }
+
+  function requestPaint() {
+    needsPaint = true;
+  }
+
+  function drawOverlay() {
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    // Held back until the camera has settled on the walker and the map has
+    // arrived, so the trace does not hang in space over an empty globe while
+    // the view is still moving into place.
+    if (!TRACE_ENABLED || !latest || trail.length < 2) return;
+    if (!revealed) {
+      const ready = !TILES_ENABLED || tilesReady() >= 0.85;
+      if (!settled || !ready || !cameraAtRest(performance.now())) return;
+      revealed = true;
+      stage.style.opacity = '1';
+    }
+    const s = latest;
+    const cone = viewCone();
+    const casing = theme === 'light' ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.6)';
+
+    // The spokes are anchored at the fork the walker has just left, so they fade
+    // out as it walks away. Left at full strength they linger hundreds of metres
+    // behind as dashes with nothing attached to them.
+    const legFrom = Math.min(s.legStart ?? 0, trail.length - 1);
+    const legSpan = Math.max(1, trail.length - 1 - legFrom);
+    const fade = s.decisionIsCurrent ? Math.max(0, 1 - (cursor.i - legFrom) / legSpan) : 0;
+
+    // Spokes are dashed: at street zoom a 450m spoke crosses the whole view and
+    // a solid one reads as a detached piece of trace.
+    if (fade > 0.04) {
+      ctx.setLineDash([5, 5]);
+      for (const b of s.branches) {
+        if (b.line.length < 2) continue;
+        project(b.line, unitVectors(b.line), cone);
+        strokeProjected(2.5 + b.probability * 4, casing);
+        strokeProjected(
+          1 + b.probability * 3,
+          traceColor(s.remoteness, 0.4, (0.35 + b.probability * 0.55) * fade),
+        );
+      }
+      ctx.setLineDash([]);
+    }
+
+    const tail = historyTail();
+    if (tail.length > 1) {
+      project(tail, tailVecs, cone);
+      strokeProjected(4.5, casing);
+      strokeProjected(2.2, traceColor(tail[0][2] ?? 0, 0.15));
+    }
+
+    const head = trail.slice(Math.max(0, cursor.i - HEAD_POINTS), Math.min(cursor.i + 1, trail.length));
+    head.push(cursorAt());
+    if (head.length > 1) {
+      project(head, unitVectors(head), cone);
+      strokeProjected(5, casing);
+      strokeProjected(2.8, traceColor(s.remoteness, 1));
+    }
+
+    for (const b of s.branches) {
+      if (b.line.length < 2) continue;
+      if (fade <= 0.04) break;
+      const tip = b.line[b.line.length - 1];
+      const tv = unitVectors([tip]);
+      if (tv[0] * cone.x + tv[1] * cone.y + tv[2] * cone.z < cone.cos) continue;
+      const c = globe.getScreenCoords(tip[0], tip[1], SURFACE_ALT);
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 1.5 + b.probability * 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = traceColor(s.remoteness, 1, (0.35 + b.probability * 0.6) * fade);
+      ctx.fill();
+    }
+  }
+
+  function markers(s) {
+    const ahead = trail[Math.min(cursor.i + 1, trail.length - 1)];
+    const here = cursorAt();
+    const westward = ahead ? ahead[1] < here[1] : false;
+    walker.build = () => walkerElement(traceColor(s.remoteness, 1), westward, s.paused);
+    globe.htmlElementsData([walker]);
+  }
+
+  let lastFrame = 0;
+  let lastPaint = 0;
+  let lastTiles = 0;
+  let needsPaint = false;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.25, (now - lastFrame) / 1000);
+    lastFrame = now;
+
+    syncPov(now);
+    if (tilesDirty && now - lastTiles > 120) {
+      lastTiles = now;
+      updateTiles();
+    }
+
+    if (trail.length >= 2) {
+      let budget = speed * dt;
+      while (budget > 0 && cursor.i < trail.length - 1) {
+        const seg = segKm(trail[cursor.i], trail[cursor.i + 1]);
+        if (seg <= 1e-9) { cursor.i++; cursor.frac = 0; continue; }
+        const rest = (1 - cursor.frac) * seg;
+        if (budget < rest) { cursor.frac += budget / seg; break; }
+        budget -= rest;
+        cursor.i++;
+        cursor.frac = 0;
+      }
+      const p = cursorAt();
+      walker.lat = p[0];
+      walker.lon = p[1];
+    }
+
+  }
+
+  const pct = (p) => Math.round(p * 100) + '%';
+  const escape = (t) => String(t ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+
+  function bar(name, value, dim) {
+    return (
+      '<div class="bar' + (dim ? ' dim' : '') + '">' +
+      '<span class="name">' + name + '</span>' +
+      '<span class="pct">' + pct(value) + '</span>' +
+      '<span class="track"><span class="fill" style="width:' + Math.max(1, value * 100) + '%"></span></span>' +
+      '</div>'
+    );
+  }
+
+  function renderRail(s) {
+    document.documentElement.style.setProperty('--accent', `hsl(${hue(s.remoteness)}, 100%, ${theme === 'light' ? 45 : 70}%)`);
+    document.getElementById('here').firstChild.nodeValue = s.place || 'setting out';
+    document.getElementById('onroad').textContent = s.road ? 'took ' + s.road : '';
+
+    const winner = s.branches.find((b) => b.chosen);
+    document.getElementById('verdict').innerHTML =
+      escape(winner ? winner.road : 'Turned back') + ' <span>' + pct(winner ? winner.probability : s.back) + '</span>';
+    document.getElementById('mood').textContent = s.confidence
+      ? `conf ${s.confidence.toFixed(2)} · ${s.confidence < 0.4 ? 'torn' : s.confidence < 0.7 ? 'unsure' : 'certain'}`
+      : '';
+
+    const options = [
+      ...s.branches.map((b) => ({
+        name: `${b.road} — ${b.direction}` + (b.ground && !b.ground.startsWith('ground not') ? ' · retraced' : ''),
+        p: b.probability,
+        dim: !b.chosen,
+      })),
+      // Only for journeys recorded while turning back was still on offer.
+      ...(s.back > 0 ? [{ name: 'back the way it came', p: s.back, dim: !!winner }] : []),
+    ].sort((a, b) => b.p - a.p);
+    document.getElementById('choices').innerHTML = options.map((o) => bar(escape(o.name), o.p, o.dim)).join('');
+
+    const level = (scale, v) => scale[Math.min(scale.length - 1, Math.round(v))];
+    document.getElementById('judgements').innerHTML =
+      bar(`wanderlust — ${level(s.scales.wanderlust, s.wanderlust)}`, s.wanderlust / 3) +
+      bar(`remoteness — ${level(s.scales.remoteness, s.remoteness)}`, s.remoteness / 3) +
+      bar('going in circles', s.circling);
+
+    document.getElementById('feedrows').innerHTML = s.feed
+      .map((f) => '<div><i>' + f.t.slice(11, 16) + '</i><b>' + escape(f.road) + '</b><i>' + f.confidence.toFixed(2) + '</i></div>')
+      .join('');
+  }
+
+  // Recentring on every decision meant a three second fly-to every tick, and
+  // each one runs globe.gl's tile cull dozens of times. Only chase the walker
+  // once it has drifted out of the middle of the view.
+  function wandered(s) {
+    if (followed === null) return true;
+    const c = globe.getScreenCoords(s.position.lat, s.position.lon, SURFACE_ALT);
+    if (!c || !isFinite(c.x) || !isFinite(c.y)) return true;
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    return c.x < w * 0.25 || c.x > w * 0.75 || c.y < h * 0.25 || c.y > h * 0.75;
+  }
+
+  function render(s) {
+    const firstFrame = !walking;
+    latest = s;
+
+    // Trace arrives as an append, not a whole copy. If the server's idea of
+    // where we are ever disagrees, drop back to asking for all of it.
+    if (s.traceFrom === 0) trail = s.trace;
+    else if (s.traceFrom === trailTotal) trail = trail.concat(s.trace);
+    else { trailTotal = 0; return; }
+    trailTotal = s.traceTotal;
+
+    if (firstFrame) {
+      cursor = { i: Math.max(0, trail.length - 1), frac: 0 };
+      walking = true;
+    }
+    cursor.i = Math.min(cursor.i, Math.max(0, trail.length - 1));
+    speed = s.paused ? 0 : remainingKm() / Math.max(1, s.tickMs / 1000);
+
+    const p = cursorAt();
+    walker.lat = p[0];
+    walker.lon = p[1];
+    markers(s);
+    requestPaint();
+    renderRail(s);
+
+    // Leave the camera alone while the viewer is driving it, and for a while
+    // after: a follow fly-to landing mid-gesture makes the map shake.
+    const key = `${s.position.lat.toFixed(3)},${s.position.lon.toFixed(3)}`;
+    const busy = interacting || performance.now() - lastInteraction < 4000;
+    if (key !== followed && !(busy && followed !== null) && wandered(s)) {
+      if (followed === null) {
+        // No zoom-in on load. Every tile zoom level the camera passes through
+        // costs a screenful of requests, and a few hundred sockets at once is
+        // enough to exhaust the browser's file descriptors and take it down.
+        globe.pointOfView({ lat: s.position.lat, lng: s.position.lon, altitude: followAltitude }, 0);
+      } else {
+        // Instant, not a 3s glide. globe.gl moves the camera inside its own
+        // animation callback, so during a tween the WebGL render and the 2D
+        // overlay end up a frame apart and the trace visibly shakes.
+        globe.pointOfView({ lat: s.position.lat, lng: s.position.lon, altitude: followAltitude }, 0);
+      }
+      followed = key;
+      settled = true;
+    }
+
+    document.getElementById('where').textContent =
+      [s.place, s.road && 'took ' + s.road,
+       s.confidence ? (s.confidence < 0.4 ? 'torn' : s.confidence < 0.7 ? 'unsure' : 'certain') : '',
+      ].filter(Boolean).join(' · ');
+    document.getElementById('km').textContent = s.stats.km.toLocaleString();
+    document.getElementById('stops').textContent = s.stats.forks;
+    document.getElementById('days').textContent = s.stats.days;
+    document.getElementById('countries').textContent = s.stats.countries;
+    document.getElementById('err').textContent = s.error ?? '';
+    document.getElementById('attr').textContent = '© ' + BASEMAPS[basemap].credit;
+    document.getElementById('pause').textContent = s.paused ? 'resume' : 'pause';
+    store.set('pov', JSON.stringify({ lat: s.position.lat, lng: s.position.lon, altitude: followAltitude }));
+  }
+
+  let shownTiles = null;
+  function applyLook() {
+    document.documentElement.dataset.theme = theme;
+    document.getElementById('theme').textContent = theme === 'light' ? 'light' : 'dark';
+    // No globe rebuild for a basemap change. That was only needed while
+    // globe.gl's tile engine refused to swap sources; our own layer just points
+    // somewhere else, and rebuilding made the whole view flash and re-fly.
+    if (!globe) buildGlobe();
+    globe
+      .backgroundColor(theme === 'light' ? '#dfe5eb' : '#05070b')
+      .globeImageUrl(FAR_IMAGE[theme]);
+    if (service() !== shownTiles) {
+      shownTiles = service();
+      globe.tilesData([]);
+      tilesShown = 0;
+    }
+    tilesDirty = true;
+    povSent = 0;
+    syncPov(performance.now());
+    for (const b of document.querySelectorAll('#basemaps button')) {
+      b.setAttribute('aria-pressed', String(b.dataset.map === basemap));
+    }
+    if (latest) { renderRail(latest); markers(latest); requestPaint(); }
+  }
+
+  document.getElementById('basemaps').innerHTML = Object.keys(BASEMAPS)
+    .map((k) => `<button data-map="${k}">${k}</button>`)
+    .join('');
+  document.getElementById('basemaps').onclick = (e) => {
+    const pick = e.target.dataset && e.target.dataset.map;
+    if (!pick) return;
+    basemap = pick;
+    store.set('map', pick);
+    applyLook();
+  };
+  document.getElementById('theme').onclick = () => {
+    theme = theme === 'light' ? 'dark' : 'light';
+    store.set('theme', theme);
+    applyLook();
+  };
+  applyLook();
+
+  // Started after buildGlobe so globe.gl's own animation callback is registered
+  // first and ours runs after its camera update. Registered before it, every
+  // paint used the previous frame's camera and the trace swam while dragging.
+  requestAnimationFrame(frame);
+
+  document.getElementById('pause').onclick = async (e) => {
+    const { paused } = await (await fetch('/api/pause', { method: 'POST' })).json();
+    e.target.textContent = paused ? 'resume' : 'pause';
+  };
+
+  stage.addEventListener('wheel', () => { lastInteraction = performance.now(); }, { passive: true });
+
+  const poll = () =>
+    fetch('/api/state?since=' + trailTotal).then((r) => r.json()).then(render).catch(() => {});
+  poll();
+  setInterval(poll, 2000);
+</script>
