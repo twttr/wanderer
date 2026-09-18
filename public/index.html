@@ -145,7 +145,9 @@
 </aside>
 
 <script src="https://cdn.jsdelivr.net/npm/globe.gl@2"></script>
-<script>
+<script type="module">
+  import { BASEMAPS, FAR_IMAGE, SURFACE_ALT, createTileLayer } from './tiles.js';
+
   const store = {
     get(k, fallback) { try { return localStorage.getItem(k) ?? fallback; } catch { return fallback; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch {} },
@@ -155,25 +157,7 @@
   // require a key and forbid rendering their tiles outside their own SDKs.
   // Served through our own process, which caches each tile on disk. Reloads
   // then cost nothing and Esri is asked for each tile exactly once.
-  const BASEMAPS = {
-    map: { dark: 'dark', light: 'light', maxLevel: 16, credit: 'Esri · OpenStreetMap' },
-    satellite: { both: 'imagery', maxLevel: 17, credit: 'Esri · Maxar · Earthstar Geographics' },
-    terrain: { both: 'topo', maxLevel: 17, credit: 'Esri · OpenStreetMap' },
-  };
 
-  // Shown when zoomed out past the point where map tiles are worth fetching.
-  const FAR_IMAGE = {
-    dark: 'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg',
-    light: 'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg',
-  };
-  const TILES_OFF_ABOVE = 0.05;
-  const TILE_PIXELS = 256;
-  const MAX_TILES = 120;
-  const TILE_CACHE_MAX = 240;
-  // Map tiles and the 2D overlay must sit at exactly the same altitude. A
-  // difference of even a hundred metres projects to a visible offset as soon as
-  // the view is off vertical, which reads as the trace sliding off the roads.
-  const SURFACE_ALT = 0.00002;
 
   // Remembered so a reload opens at the right place and zoom immediately,
   // without the globe sitting at its default whole-world view first.
@@ -239,10 +223,10 @@
   }
 
   const service = () => BASEMAPS[basemap].both ?? BASEMAPS[basemap][theme];
-  const tileUrl = (z, x, y) => `/tile?s=${service()}&z=${z}&y=${y}&x=${x}`;
 
   let globe = null;
   let camera = null;
+  let tileLayer = null;
   let threeGlobe = null;
   let povSent = 0;
   let globeBuiltAt = 0;
@@ -400,6 +384,13 @@
       tilesDirty = true;
     });
 
+    tileLayer = createTileLayer({
+      globe,
+      stage,
+      service,
+      maxLevel: () => BASEMAPS[basemap].maxLevel,
+      enabled: TILES_ENABLED,
+    });
     sizeCanvas();
     // Immediately, before a frame is rendered. Left at globe.gl's default
     // whole-world view the tile engine starts loading low zoom levels, and
@@ -409,140 +400,7 @@
     syncPov(performance.now());
     if (latest) { markers(latest); requestPaint(); }
   }
-
-  // Map tiles, driven by us rather than by globe.gl's engine. We decide which
-  // tiles exist, cap how many there can ever be, and evict textures on the way
-  // out, so nothing accumulates and no single pass can be enormous.
-  const tileCache = new Map();
-  let MatCtor = null;
-  let TexCtor = null;
-  let texColorSpace;
   let tilesDirty = true;
-  let tilesShown = 0;
-  let currentTiles = [];
-  const tilesReady = () =>
-    !currentTiles.length
-      ? 0
-      : currentTiles.filter((t) => t.material.userData.ready).length / currentTiles.length;
-
-  function ctorsReady() {
-    if (MatCtor && TexCtor) return true;
-    const m = globe && globe.globeMaterial && globe.globeMaterial();
-    if (!m) return false;
-    MatCtor = m.constructor;
-    if (m.map) {
-      TexCtor = m.map.constructor;
-      texColorSpace = m.map.colorSpace;
-    }
-    return !!(MatCtor && TexCtor);
-  }
-
-  function tileMaterial(z, x, y) {
-    const key = `${service()}/${z}/${x}/${y}`;
-    const hit = tileCache.get(key);
-    if (hit) {
-      tileCache.delete(key);
-      tileCache.set(key, hit);
-      return hit;
-    }
-    const tex = new TexCtor();
-    if (texColorSpace !== undefined) tex.colorSpace = texColorSpace;
-    const mat = new MatCtor({ map: tex });
-    const img = new Image();
-    img.onload = () => {
-      tex.image = img;
-      tex.needsUpdate = true;
-      mat.needsUpdate = true;
-      mat.userData.ready = true;
-    };
-    img.src = tileUrl(z, x, y);
-    tileCache.set(key, mat);
-    while (tileCache.size > TILE_CACHE_MAX) {
-      const oldest = tileCache.keys().next().value;
-      const dead = tileCache.get(oldest);
-      tileCache.delete(oldest);
-      try { dead.map && dead.map.dispose(); dead.dispose(); } catch {}
-    }
-    return mat;
-  }
-
-  const POW = (z) => Math.pow(2, z);
-  const lng2tile = (lng, z) => ((lng + 180) / 360) * POW(z);
-  const lat2tile = (lat, z) => {
-    const r = (Math.max(-85, Math.min(85, lat)) * Math.PI) / 180;
-    return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * POW(z);
-  };
-  const tile2lng = (x, z) => (x / POW(z)) * 360 - 180;
-  const tile2lat = (y, z) => {
-    const n = Math.PI - (2 * Math.PI * y) / POW(z);
-    return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
-  };
-
-  function updateTiles() {
-    if (!globe) return;
-    const alt = viewAltitude();
-    if (!TILES_ENABLED || alt > TILES_OFF_ABOVE) {
-      if (tilesShown) { globe.tilesData([]); tilesShown = 0; }
-      return;
-    }
-    if (!ctorsReady()) {
-      // The texture class is borrowed from the globe's own image, which loads
-      // asynchronously — keep asking until it is there.
-      tilesDirty = true;
-      return;
-    }
-
-    // Visible ground extent for a 50 degree vertical field of view: the half
-    // angle subtended at the globe's centre is about 26.7 degrees per unit of
-    // altitude. An earlier guess of 90x1.7 claimed nearly six times as much
-    // ground as is actually on screen, which picked a far coarser zoom level.
-    const pov = globe.pointOfView();
-    const aspect = stage.clientWidth / Math.max(1, stage.clientHeight);
-    const halfLat = Math.min(60, alt * 26.7 * 1.15);
-    const halfLng = Math.min(60, (halfLat * aspect) / Math.max(0.15, Math.cos((pov.lat * Math.PI) / 180)));
-    // Tiles are 256 device pixels, not CSS pixels — on a retina display sizing
-    // them in CSS pixels throws away another level of detail.
-    const across = Math.max(1, (stage.clientWidth * (devicePixelRatio || 1)) / TILE_PIXELS);
-    let z = Math.round(Math.log2(360 / ((2 * halfLng) / across)));
-    z = Math.max(1, Math.min(BASEMAPS[basemap].maxLevel, z));
-
-    let box = null;
-    for (; z >= 1; z--) {
-      const x0 = Math.floor(lng2tile(pov.lng - halfLng, z));
-      const x1 = Math.floor(lng2tile(pov.lng + halfLng, z));
-      const y0 = Math.floor(lat2tile(pov.lat + halfLat, z));
-      const y1 = Math.floor(lat2tile(pov.lat - halfLat, z));
-      if ((x1 - x0 + 1) * (y1 - y0 + 1) <= MAX_TILES) {
-        box = { z, x0, x1, y0, y1 };
-        break;
-      }
-    }
-    if (!box) return;
-    tilesDirty = false;
-
-    const span = POW(box.z);
-    const data = [];
-    for (let x = box.x0; x <= box.x1; x++) {
-      for (let y = box.y0; y <= box.y1; y++) {
-        if (y < 0 || y >= span) continue;
-        const xi = ((x % span) + span) % span;
-        const north = tile2lat(y, box.z);
-        const south = tile2lat(y + 1, box.z);
-        const west = tile2lng(xi, box.z);
-        const east = tile2lng(xi + 1, box.z);
-        data.push({
-          lat: (north + south) / 2,
-          lng: (west + east) / 2,
-          width: east - west,
-          height: north - south,
-          material: tileMaterial(box.z, xi, y),
-        });
-      }
-    }
-    globe.tilesData(data);
-    currentTiles = data;
-    tilesShown = data.length;
-  }
 
   const viewAltitude = () => (globe ? Math.max(1e-7, globe.controls().getDistance() / 100 - 1) : 0.0009);
 
@@ -766,7 +624,7 @@
     // the view is still moving into place.
     if (!TRACE_ENABLED || !latest || trail.length < 2) return;
     if (!revealed) {
-      const ready = !TILES_ENABLED || tilesReady() >= 0.85;
+      const ready = !TILES_ENABLED || (tileLayer && tileLayer.ready >= 0.85);
       if (!settled || !ready || !cameraAtRest(performance.now())) return;
       revealed = true;
       stage.style.opacity = '1';
@@ -845,9 +703,10 @@
     lastFrame = now;
 
     syncPov(now);
-    if (tilesDirty && now - lastTiles > 120) {
+    if (tilesDirty && tileLayer && now - lastTiles > 120) {
       lastTiles = now;
-      updateTiles();
+      // Retried next frame if the layer is not ready to draw yet.
+      tilesDirty = !tileLayer.update(viewAltitude());
     }
 
     if (trail.length >= 2) {
@@ -999,8 +858,7 @@
       .globeImageUrl(FAR_IMAGE[theme]);
     if (service() !== shownTiles) {
       shownTiles = service();
-      globe.tilesData([]);
-      tilesShown = 0;
+      if (tileLayer) tileLayer.clear();
     }
     tilesDirty = true;
     povSent = 0;

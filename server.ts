@@ -1,123 +1,19 @@
 import { createServer } from "node:http";
-import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, readFileSync, existsSync } from "node:fs";
 import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
 import type { JsonValue } from "@typesafe-ai/sdk";
 import { bearing, compassWord, destination, distanceKm } from "./geo.ts";
+import { serveTile, tileStats } from "./tiles.ts";
+import {
+  JOURNAL, KM_PER_DAY, NETWORK_RADIUS_M, OVERPASS, PORT, ROADS,
+  SPOKE_MAX_KM, STEP_KM, TICK_MS, USER_AGENT,
+} from "./config.ts";
 
-const PORT = Number(process.env.PORT ?? 8787);
-const TICK_MS = Number(process.env.TICK_MS ?? 15000);
-const JOURNAL = process.env.JOURNAL ?? "journey.jsonl";
-const CONTACT = process.env.CONTACT ?? "https://github.com/local/wanderer";
-const USER_AGENT = `wanderer/1.0 (+${CONTACT})`;
-const OVERPASS = (
-  process.env.OVERPASS_URL ??
-  "https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter"
-).split(",");
 
-// Which highway classes the walker may use, and therefore what counts as a fork
-// worth stopping for. The default is "real forks": the classified network that
-// links villages, so bends and side streets do not interrupt the walk. Append
-// |residential|living_street|service|track to stop at every junction instead —
-// faithful to "turns wherever there is more than one road", but in a town that
-// is a decision every thirty metres and the walk never leaves it.
-const ROADS =
-  process.env.ROADS ?? "motorway|trunk|primary|secondary|tertiary|unclassified|road";
 
-const STEP_KM = Number(process.env.STEP_KM ?? 2.5);
-const SPOKE_MAX_KM = Number(process.env.SPOKE_MAX_KM ?? 0.45);
-const NETWORK_RADIUS_M = Number(process.env.NETWORK_RADIUS_M ?? 3000);
-const KM_PER_DAY = 40;
 
 const SEED = { lat: 43.6766, lon: 4.6278 };
 
-// Esri serves a tile in about 16ms, but the browser refetches every tile on
-// every reload. Cached here they come back off disk, and Esri is asked for each
-// one exactly once.
-// ponytail: cache grows without bound (tiles are 5-20kB); delete the directory
-// if it ever matters, or add an age sweep.
-const TILE_CACHE = process.env.TILE_CACHE ?? "tiles";
-const TILE_SERVICES: Record<string, string> = {
-  imagery: "World_Imagery",
-  topo: "World_Topo_Map",
-  dark: "Canvas/World_Dark_Gray_Base",
-  light: "Canvas/World_Light_Gray_Base",
-};
-const tileStats = { hit: 0, miss: 0, failed: 0 };
-
-const tileInFlight = new Map<string, Promise<Buffer>>();
-
-/**
- * A complete PNG or JPEG. The trailer matters as much as the magic: a file left
- * half-written by an earlier, non-atomic save still starts with valid magic and
- * would be served forever as a broken tile.
- */
-function looksLikeImage(b: Buffer): boolean {
-  if (b.length < 1024) return false;
-  if (b[0] === 0xff && b[1] === 0xd8) return b[b.length - 2] === 0xff && b[b.length - 1] === 0xd9;
-  if (b[0] === 0x89 && b[1] === 0x50) return b.subarray(-8, -4).toString("latin1") === "IEND";
-  return false;
-}
-
-async function fetchTile(service: string, key: string, file: string, z: number, y: number, x: number) {
-  const pending = tileInFlight.get(key);
-  if (pending) return pending;
-
-  const job = (async () => {
-    const upstream = await fetch(
-      `https://server.arcgisonline.com/ArcGIS/rest/services/${service}/MapServer/tile/${z}/${y}/${x}`,
-      { headers: { "User-Agent": USER_AGENT }, signal: AbortSignal.timeout(8000) },
-    );
-    if (!upstream.ok) throw new Error(`HTTP ${upstream.status}`);
-    const bytes = Buffer.from(await upstream.arrayBuffer());
-    // Written through a temporary name: writeFileSync is not atomic, and the
-    // first page load asks for eighty tiles at once, so a concurrent reader
-    // would otherwise catch a half-written file.
-    mkdirSync(dirname(file), { recursive: true });
-    const temp = `${file}.${process.pid}.tmp`;
-    writeFileSync(temp, bytes);
-    renameSync(temp, file);
-    return bytes;
-  })().finally(() => tileInFlight.delete(key));
-
-  tileInFlight.set(key, job);
-  return job;
-}
-
-async function serveTile(query: URLSearchParams, res: import("node:http").ServerResponse) {
-  const name = query.get("s") ?? "";
-  const service = TILE_SERVICES[name];
-  const [z, y, x] = ["z", "y", "x"].map((k) => Number(query.get(k)));
-  if (!service || ![z, y, x].every((n) => Number.isInteger(n) && n >= 0)) {
-    res.writeHead(400).end();
-    return;
-  }
-
-  const file = join(TILE_CACHE, name, String(z), String(y), `${x}.bin`);
-  const key = `${name}/${z}/${y}/${x}`;
-  let bytes: Buffer;
-  try {
-    const cached = existsSync(file) ? readFileSync(file) : null;
-    if (cached && looksLikeImage(cached)) {
-      bytes = cached;
-      tileStats.hit++;
-    } else {
-      bytes = await fetchTile(service, key, file, z, y, x);
-      tileStats.miss++;
-    }
-  } catch {
-    tileStats.failed++;
-    res.writeHead(502).end();
-    return;
-  }
-
-  const png = bytes[0] === 0x89 && bytes[1] === 0x50;
-  res.writeHead(200, {
-    "Content-Type": png ? "image/png" : "image/jpeg",
-    "Cache-Control": "public, max-age=31536000, immutable",
-  });
-  res.end(bytes);
-}
 
 interface Way {
   id: number;
@@ -904,7 +800,21 @@ function snapshot(since: number) {
   };
 }
 
-const page = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+// Served straight from disk: no bundler, so the browser loads ES modules by
+// their real paths.
+const STATIC: Record<string, string> = { ".html": "text/html", ".js": "text/javascript" };
+
+function serveStatic(path: string, res: import("node:http").ServerResponse): boolean {
+  const name = path === "/" ? "index.html" : path.replace(/^\//, "");
+  if (!/^[\w.-]+$/.test(name) || name.includes("..")) return false;
+  const type = STATIC[name.slice(name.lastIndexOf("."))];
+  if (!type) return false;
+  const file = new URL(`./public/${name}`, import.meta.url);
+  if (!existsSync(file)) return false;
+  res.writeHead(200, { "Content-Type": `${type}; charset=utf-8` });
+  res.end(readFileSync(file));
+  return true;
+}
 
 createServer((req, res) => {
   const [path, query] = (req.url ?? "/").split("?");
@@ -927,10 +837,7 @@ createServer((req, res) => {
   } else if (path === "/tilestats") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(tileStats));
-  } else if (path === "/") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(page);
-  } else {
+  } else if (!serveStatic(path, res)) {
     res.writeHead(404).end();
   }
 }).listen(PORT, () => console.log(`walking at http://localhost:${PORT}`));
